@@ -1,0 +1,199 @@
+;;; timer1_compa_isr is used to distinguish between 
+;;; the end of letter inputs and verifying timer overflows
+
+;;; timer1_cpt_isr times the duration of button
+;;; presses (and releases), differntiates from short and long presses,
+;;; and resets timer when called
+
+;;; r19 = used as a flag that indicates whether the timer has overflowed 
+;;; 	  while a button was pressed
+;;; r23 = morse length
+;;; r24 = morse symbol
+	
+#define __SFR_OFFSET 0
+#include <avr/io.h>
+#include "7segment.S"
+	
+	CPU_FREQ = 16000000					; Frequency of the CPU in Hz
+	TICKS_PER_SEC = CPU_FREQ / (256 * 1024)			; 1 second
+
+	DECISION_LIMIT = 2 * TICKS_PER_SEC / 10			; 200ms, time between dots and dashes
+	INTER_LETTER_LIMIT = 4 * TICKS_PER_SEC / 10		; 400ms, time between individual letters
+
+	BUTTON = 0			; Button variable points to PIN0
+
+	.section .text
+	.global main
+main:
+;; Setting up ports
+	ldi r16, ALL_SEGS		
+	out DDRD, r16			; Make register 16 output to PORTD
+
+	sbi PORTB, BUTTON 		; Set PIN0 as output for PORTB
+
+;; Setting up timer
+	ldi r16, INTER_LETTER_LIMIT		
+	sts OCR1AH, r16			; When timer goes over INTER_LETTER_LIMIT (400ms), overflow
+
+	clr r16				
+	sts OCR1AL, r16			; Only high byte needed
+
+	sts TCCR1A, r16 		; Setting timer output mode: no output
+
+	ldi r16, _BV(ICIE1) | _BV(OCIE1A)		; Enable Input Capture Interrupt and
+							; Output Compare A Match Interrupt
+	sts TIMSK1, r16					; Set Timer Interrupt Mask
+
+	;; Enable noise canceller, set prescaler to 1024, and start
+	;; timer in CTC mode
+	ldi r16,  _BV(ICNC1)  | _BV(WGM12) | _BV(CS12) | _BV(CS10)
+	sts TCCR1B, r16		
+
+	clr r19				; Assuring registers are cleared before being used
+	clr r23			
+	clr r24
+
+	sei				; Enable interrupts globally
+
+wait_for_interrupt:	rjmp wait_for_interrupt		; Infinite loop, branches based on interrupt
+
+;;; This interrupt service routine is called whenever timer overflows
+;;; ie when more than 400ms have elapses since the last button press or release
+	.global timer1_compa_isr  
+timer1_compa_isr:
+
+	push r16			
+	in r16, SREG			; Save the status register
+	push r16
+
+	;; Check whether we are waiting for a button press or release:
+	lds r16, TCCR1B		
+ 	sbrs r16, ICES1 		; Skip next instructiom if waiting for rising edge (ICES = 1)
+	rjmp awaiting_press		; We have a falling edge ie we are waiting for a button press	
+
+;;; Button has been pressed for 400ms, record long press
+awaiting_release:
+
+	ser r19 			; Set overflow flag r19		
+	rjmp 1f
+
+;;; Button has not been pressed for 400ms
+awaiting_press:
+
+	tst r23				; If there was no input..
+	breq 1f				; do not clear output
+
+	rcall get_digit		
+	out PORTD, r24			; Output corresponding digit on display
+
+	clr r23				; Clear registers for next input
+	clr r24
+
+1:
+	pop r16
+	out SREG, r16 			; Restore status register
+	pop r16
+
+	reti				; Returns to wait_for_interrupt
+
+
+
+;;; It is called whenever the signal at ICP1 (PORTB0) changes in a
+;;; certain direction (ie when the button has been pressed or released).
+;;; If we are called for a falling edge (button has just been depressed),
+;;; we go on waiting for a rising edge (button will be released) and vice-versa.
+	.global timer1_cpt_isr
+timer1_cpt_isr:
+
+	push r8
+	in r8, SREG 			; Save the status register
+	push r8
+
+	lds r8, ICR1L			; Get the timer count when the capture event happened
+	lds r8, ICR1H      		; Discard the low part, only interested in the high part, but
+					; reading low byte is necessary to get a correct high byte in ICR1H
+	push r17
+
+	;; Debounce button:
+	mov r17,r19			;  If there is no timer-overflow (ie a very long button press) and									
+	or r17,r8			;  ICR1H is still zero, then  less than 16ms have elapsed since
+	breq debounce			;  last release or press and we do nothing
+
+	;; Reset timer
+	clr r17
+	sts TCNT1H, r17 		; Writing the high byte to the latch
+	sts TCNT1L, r17			; Then the low byte 
+
+	;; Check whether we were looking for a rising or a falling edge:
+	lds r17, TCCR1B
+	sbrs  r17, ICES1		; Skip next instruction if rising edge dedected
+
+	rjmp pressed			; We have a falling edge ie button has been pressed
+
+	;; Rising edge, button has been released
+	rcall released
+
+	andi r17, ~(_BV(ICES1))		; We have had rising edge, so next
+					; time looking for falling edge
+	rjmp end_isr
+
+;;; This subroutine handles the start of a button press
+pressed:
+	;; Clear screen if r23 is zero, ie it is the first input for the letter
+	tst r23				
+	brne 1f				
+
+	push r24
+	ldi r24, ALL_SEGS
+	out PORTD, r24
+	pop r24
+
+1:
+	ori r17, _BV(ICES1)		; Next time detect rising edge, ie a
+					; button release.
+
+end_isr:
+	sts TCCR1B, r17 		; Activate change in edge direction
+
+debounce:
+	pop r17
+	pop r8
+	out SREG, r8			; Restore status register
+	pop r8
+
+	reti				; Returns to wait_for_interrupt
+
+;;; This subroutine handles the end of a button press (button released)
+released:
+
+	push r16
+
+	inc r23				; Length of morse increases every press
+	brcs overflow_handling		; If button is pressed 256 times we handle overflow
+					; so that 256 presses don't count as a single dot
+	
+	lsl r24				; Shift last bit to left to create bit pattern
+	
+	tst r19				; If we had a timer overflow..
+	brne long_press			; then signal it is a long press
+
+	;; Checking if the signal is longer than DECISION_LIMIT (200ms)
+	ldi r16, DECISION_LIMIT
+	cp r8,r16
+	brcs short_press		; If it is shorter jump to label short
+
+long_press:
+	inc r24				; Increase value of last bit to create bit pattern
+	rjmp 1f
+
+short_press:
+	nop				; Do nothing (as 0 counts as a dot, there's no need to increase)
+	rjmp 1f
+
+overflow_handling:			
+	ldi r24, _ERROR			; Output ERROR
+	out PORTD, r24
+1:
+	pop r16
+	clr r19				; Clear overflow flag before next button press
+	ret				; Return to wait_for_interrupt 
